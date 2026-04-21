@@ -1,19 +1,23 @@
-command: ["streamlit", "run", "app.py"]
-
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.port
+  - "8000"
+  - --server.address
+  - "0.0.0.0"
 env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: ab79eced8207d29b
   - name: DEMO_CATALOG
     value: lr_serverless_aws_us_catalog
   - name: DEMO_SCHEMA
     value: radar_hh_quote_analytics
-  - name: DATABRICKS_WAREHOUSE_ID
-    valueFrom: sql-warehouse
   # Set after creating the Genie space in step 3:
   # - name: GENIE_SPACE_ID
   #   value: <space-id>
-
 resources:
   - name: sql-warehouse
-    description: Serverless SQL warehouse used by the app
     sql_warehouse:
-      id: <REPLACE-WITH-WAREHOUSE-ID>
+      id: ab79eced8207d29b
       permission: CAN_USE

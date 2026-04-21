@@ -23,6 +23,22 @@ from config import (
     volume_path,
 )
 from db import query
+import genie
+
+
+def _save_to_volume(pretty_json: str, tx_id: str, key: str) -> None:
+    """Save a payload JSON to a Unity Catalog volume using the SDK's Files API."""
+    from databricks.sdk import WorkspaceClient
+
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    path = f"{volume_path()}/{tx_id}_{key}_{ts}.json"
+    try:
+        w = WorkspaceClient()
+        w.files.upload(file_path=path, contents=pretty_json.encode("utf-8"), overwrite=True)
+        st.success(f"Saved to `{path}`")
+    except Exception as exc:
+        st.error(f"Save failed: {exc}")
+
 
 st.set_page_config(page_title="Radar HH Quote Analytics", layout="wide", page_icon=":mag:")
 
@@ -47,7 +63,7 @@ natural-language Q&A on top.
     )
 
 tab_lookup, tab_analytics, tab_agent = st.tabs(
-    ["Transaction lookup", "Analytics (coming in step 2)", "Agent (coming in step 3)"]
+    ["Transaction lookup", "Analytics", "Ask Genie"]
 )
 
 # ---------------------------------------------------------------------------
@@ -200,31 +216,220 @@ with tab_lookup:
             _payload_panel("Radar Live response", payloads["rl_resp"], "rl_resp")
 
 
-def _save_to_volume(pretty_json: str, tx_id: str, key: str) -> None:
-    """Save a payload JSON to a Unity Catalog volume using the SDK's Files API."""
-    from databricks.sdk import WorkspaceClient
-
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    path = f"{volume_path()}/{tx_id}_{key}_{ts}.json"
-    try:
-        w = WorkspaceClient()
-        w.files.upload(file_path=path, contents=pretty_json.encode("utf-8"), overwrite=True)
-        st.success(f"Saved to `{path}`")
-    except Exception as exc:
-        st.error(f"Save failed: {exc}")
-
-
 # ---------------------------------------------------------------------------
-# Tab 2 — Analytics (step 2 placeholder)
+# Tab 2 — Analytics: outliers, drop-outs, price distributions
 # ---------------------------------------------------------------------------
 with tab_analytics:
-    st.info("**Coming in step 2** — peer-group outlier detection, price threshold "
-            "alerts, drop-out funnel. Leaving this tab intentionally empty so we "
-            "ship the MVP first.")
+    st.subheader("Quote stream at a glance")
+
+    try:
+        # Headline metrics
+        stats = query(
+            f"""
+            SELECT
+              COUNT(*) AS total_transactions,
+              COUNT_IF(quote_status = 'BOUND') AS bound,
+              COUNT_IF(quote_status = 'QUOTED') AS quoted_not_bound,
+              COUNT_IF(quote_status = 'ABANDONED') AS abandoned,
+              COUNT_IF(is_outlier) AS outliers,
+              ROUND(AVG(CASE WHEN quote_status <> 'ABANDONED' THEN gross_premium END), 2) AS avg_premium,
+              ROUND(PERCENTILE(gross_premium, 0.95), 2) AS p95_premium
+            FROM {full_table(TABLE_QUOTES_FLAT)}
+            """
+        ).iloc[0]
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Transactions", f"{int(stats['total_transactions']):,}")
+        m2.metric("Bound", f"{int(stats['bound']):,}",
+                  f"{stats['bound']/stats['total_transactions']:.0%} conversion")
+        m3.metric("Abandoned", f"{int(stats['abandoned']):,}",
+                  f"{stats['abandoned']/stats['total_transactions']:.0%} drop-out",
+                  delta_color="inverse")
+        m4.metric("Avg premium", f"£{stats['avg_premium']:,.0f}")
+        m5.metric("Outliers flagged", f"{int(stats['outliers']):,}", delta_color="inverse")
+    except Exception as exc:
+        st.error(f"Couldn't load summary: {exc}")
+        st.stop()
+
+    st.divider()
+
+    col_out, col_funnel = st.columns(2)
+
+    # --- Outliers: top-N by price, plus peer-group z-score ---
+    with col_out:
+        st.markdown("#### Outliers by gross premium")
+        st.caption(
+            "Hard threshold: any quote priced above p99 × 3 of its peer group "
+            "(same postcode region × property type). These are the quotes worth "
+            "replaying against Radar Base."
+        )
+        outliers = query(
+            f"""
+            WITH peers AS (
+              SELECT region, property_type,
+                     PERCENTILE(gross_premium, 0.99) AS p99
+              FROM {full_table(TABLE_QUOTES_FLAT)}
+              WHERE quote_status <> 'ABANDONED'
+              GROUP BY region, property_type
+            )
+            SELECT q.transaction_id, q.customer_name, q.region, q.property_type,
+                   ROUND(q.gross_premium, 2) AS gross_premium,
+                   ROUND(p.p99, 2) AS peer_p99,
+                   ROUND(q.gross_premium / p.p99, 2) AS vs_peer_p99,
+                   q.model_version, q.is_outlier
+            FROM {full_table(TABLE_QUOTES_FLAT)} q
+            JOIN peers p USING (region, property_type)
+            WHERE q.gross_premium > p.p99 * 3
+            ORDER BY q.gross_premium DESC
+            LIMIT 20
+            """
+        )
+        if outliers.empty:
+            st.success("No outliers beyond p99 × 3. Stream looks clean.")
+        else:
+            st.dataframe(outliers, use_container_width=True, hide_index=True)
+
+    # --- Drop-out funnel ---
+    with col_funnel:
+        st.markdown("#### Quote journey funnel")
+        st.caption("Where do customers drop out? SF request → Radar response → bound policy.")
+        funnel = query(
+            f"""
+            SELECT channel,
+                   COUNT(*) AS started,
+                   COUNT_IF(quote_status <> 'ABANDONED') AS got_price,
+                   COUNT_IF(quote_status = 'BOUND') AS bound
+            FROM {full_table(TABLE_QUOTES_FLAT)}
+            GROUP BY channel
+            ORDER BY started DESC
+            """
+        )
+        funnel["dropout_rate"] = (1 - funnel["got_price"] / funnel["started"]).round(3)
+        funnel["bind_rate"] = (funnel["bound"] / funnel["started"]).round(3)
+        st.dataframe(
+            funnel.rename(columns={
+                "channel": "Channel",
+                "started": "Started",
+                "got_price": "Priced",
+                "bound": "Bound",
+                "dropout_rate": "Drop-out %",
+                "bind_rate": "Bind %",
+            }).style.format({"Drop-out %": "{:.1%}", "Bind %": "{:.1%}"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    st.divider()
+
+    # --- Premium distribution by region (excludes outliers to keep axis sensible) ---
+    st.markdown("#### Premium distribution by region")
+    st.caption("Excludes the flagged outliers so the shape of the honest book is visible.")
+    dist = query(
+        f"""
+        SELECT region, gross_premium
+        FROM {full_table(TABLE_QUOTES_FLAT)}
+        WHERE quote_status <> 'ABANDONED'
+          AND is_outlier = false
+          AND gross_premium < 10000
+        """
+    )
+    if not dist.empty:
+        import plotly.express as px
+        fig = px.box(dist, x="region", y="gross_premium", points=False,
+                     labels={"gross_premium": "Gross premium (£)", "region": "Region"})
+        fig.update_layout(height=380, margin=dict(t=20, b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Tab 3 — Genie agent (step 3 placeholder)
+# Tab 3 — Genie agent
 # ---------------------------------------------------------------------------
 with tab_agent:
-    st.info("**Coming in step 3** — ask natural-language questions over the quote "
-            "stream via a Databricks Genie space.")
+    st.subheader("Ask questions about the quote stream")
+    st.caption(
+        "Natural-language Q&A powered by a Databricks Genie space over "
+        f"`{CATALOG}.{SCHEMA}.{TABLE_QUOTES_FLAT}`."
+    )
+
+    if not genie.is_configured():
+        st.warning(
+            "Genie space not wired up yet.\n\n"
+            "**One-time setup:**\n"
+            "1. Open Genie in the workspace and create a new space over the "
+            f"`{CATALOG}.{SCHEMA}.{TABLE_QUOTES_FLAT}` table.\n"
+            "2. Give it a short description (e.g. *Household insurance quote "
+            "stream — transactions, prices, drop-outs, outliers*).\n"
+            "3. Copy the space ID from the URL and set `GENIE_SPACE_ID` in "
+            "`app/app.yaml`, then redeploy."
+        )
+        st.stop()
+
+    # Conversation state
+    if "genie_history" not in st.session_state:
+        st.session_state.genie_history = []  # list of {role, content, sql?, df?}
+    if "genie_conv_id" not in st.session_state:
+        st.session_state.genie_conv_id = None
+
+    # Suggested prompts
+    suggestions = [
+        "How many quotes were abandoned last week by channel?",
+        "What's the average gross premium by region for bound policies?",
+        "Show me the 10 most expensive quotes and the model version that priced them.",
+        "Which property type has the highest drop-out rate?",
+    ]
+    cols = st.columns(len(suggestions))
+    picked = None
+    for i, s in enumerate(suggestions):
+        if cols[i].button(s, key=f"sugg_{i}", use_container_width=True):
+            picked = s
+
+    # Render history
+    for turn in st.session_state.genie_history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+            if turn.get("sql"):
+                with st.expander("SQL generated by Genie"):
+                    st.code(turn["sql"], language="sql")
+            if turn.get("df") is not None and not turn["df"].empty:
+                st.dataframe(turn["df"], use_container_width=True, hide_index=True)
+
+    user_msg = st.chat_input("Ask Genie about the quote stream...") or picked
+    if user_msg:
+        st.session_state.genie_history.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Genie is thinking..."):
+                try:
+                    if st.session_state.genie_conv_id is None:
+                        conv_id, msg_id = genie.start_conversation(user_msg)
+                        st.session_state.genie_conv_id = conv_id
+                    else:
+                        msg_id = genie.follow_up(st.session_state.genie_conv_id, user_msg)
+                    ans = genie.wait_for_answer(st.session_state.genie_conv_id, msg_id)
+                except Exception as exc:
+                    st.error(f"Genie call failed: {exc}")
+                    st.stop()
+
+            if ans.error:
+                st.error(f"Genie returned an error: {ans.error}")
+            else:
+                reply_md = ans.text or "_(Genie returned a SQL result — see below.)_"
+                st.markdown(reply_md)
+                if ans.sql:
+                    with st.expander("SQL generated by Genie"):
+                        st.code(ans.sql, language="sql")
+                if ans.result is not None and not ans.result.empty:
+                    st.dataframe(ans.result, use_container_width=True, hide_index=True)
+
+                st.session_state.genie_history.append({
+                    "role": "assistant",
+                    "content": reply_md,
+                    "sql": ans.sql,
+                    "df": ans.result,
+                })
+
+    if st.session_state.genie_history:
+        if st.button("Reset conversation", type="secondary"):
+            st.session_state.genie_history = []
+            st.session_state.genie_conv_id = None
+            st.rerun()
