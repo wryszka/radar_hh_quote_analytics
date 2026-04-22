@@ -53,14 +53,22 @@ def query(sql: str, params: dict | None = None) -> pd.DataFrame:
     rows = resp.result.data_array if resp.result and resp.result.data_array else []
     df = pd.DataFrame(rows, columns=cols)
 
-    # Statement Execution API returns all values as strings — coerce based on
-    # the reported column type so downstream code can treat numbers as numbers.
-    _NUM_TYPES = {"INT", "BIGINT", "SMALLINT", "TINYINT", "DOUBLE", "FLOAT", "DECIMAL"}
-    _BOOL_TYPES = {"BOOLEAN"}
+    # Statement Execution API returns all values as strings. Coerce types:
+    # - Columns flagged BOOLEAN by the schema → native bool
+    # - Every other column that parses cleanly as a number → numeric
+    # Using errors='ignore' keeps genuine string columns intact.
+    _BOOL_NAMES = {"BOOLEAN", "BOOL"}
     for c in schema_cols:
-        t = (c.type_name.value if hasattr(c.type_name, "value") else str(c.type_name)).upper()
-        if t in _NUM_TYPES:
-            df[c.name] = pd.to_numeric(df[c.name], errors="coerce")
-        elif t in _BOOL_TYPES:
-            df[c.name] = df[c.name].map(lambda v: str(v).lower() == "true" if v is not None else None)
+        raw = c.type_name
+        t_name = getattr(raw, "name", None) or getattr(raw, "value", None) or str(raw)
+        t_name = t_name.split(".")[-1].upper()
+        if t_name in _BOOL_NAMES:
+            df[c.name] = df[c.name].map(
+                lambda v: None if v is None else str(v).lower() == "true"
+            )
+            continue
+        try:
+            df[c.name] = pd.to_numeric(df[c.name], errors="raise")
+        except (ValueError, TypeError):
+            pass  # leave as string
     return df

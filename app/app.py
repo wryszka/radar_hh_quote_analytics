@@ -170,8 +170,8 @@ with tab_lookup:
                 "Bedrooms": int(m["bedrooms"]),
                 "Flood zone": m["flood_zone"],
                 "Claims last 5y": int(m["claims_last_5y"]),
-                "Buildings SI": f"£{m['buildings_si']:,}",
-                "Contents SI": f"£{m['contents_si']:,}",
+                "Buildings SI": f"£{int(m['buildings_si']):,}",
+                "Contents SI": f"£{int(m['contents_si']):,}",
             }
             st.dataframe(
                 pd.DataFrame(flat.items(), columns=["Field", "Value"]),
