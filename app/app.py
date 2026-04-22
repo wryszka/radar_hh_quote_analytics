@@ -40,6 +40,56 @@ def _save_to_volume(pretty_json: str, tx_id: str, key: str) -> None:
         st.error(f"Save failed: {exc}")
 
 
+CURRENT_RADAR_MODEL = "HH_2026_Q2_v1"
+
+
+def _simulate_radar_replay(stored_premium: float, stored_model: str,
+                           is_outlier: bool, transaction_id: str,
+                           stored_response: dict | None) -> dict:
+    """Pretend to re-call Radar Live for this transaction. Deterministic
+    per transaction. Outliers re-price sanely; regular quotes drift slightly."""
+    import hashlib
+    import random as _random
+
+    seed = int(hashlib.md5(transaction_id.encode()).hexdigest()[:8], 16)
+    rng = _random.Random(seed)
+
+    if is_outlier:
+        # Pretend today's model catches the anomaly — return a sensible price
+        # derived from the underlying SI (same order of magnitude as peers).
+        pricing = (stored_response or {}).get("pricing", {})
+        honest_base = (pricing.get("base_building_premium", 0)
+                       + pricing.get("base_contents_premium", 0))
+        net = max(honest_base * 1.1, 650.0) * rng.uniform(0.95, 1.05)
+        status = "QUOTED"
+        notes = ("The current Radar Live model prices this risk within the "
+                 "expected band. The £3M figure was not reproduced — look "
+                 "upstream (Salesforce payload, API mapping, or factor "
+                 "overrides) for the source of the anomaly.")
+    else:
+        drift = rng.uniform(-0.015, 0.015)
+        net = stored_premium / 1.12 * (1 + drift)  # back out IPT, re-drift
+        status = "QUOTED"
+        notes = ("Price reproduces within ±1.5% — any delta is normal model "
+                 "drift between quote date and today.")
+
+    ipt = round(net * 0.12, 2)
+    gross = round(net + ipt, 2)
+    return {
+        "quote_reference": f"RL-REPLAY-{seed:08X}",
+        "salesforce_transaction_id": transaction_id,
+        "model_version": CURRENT_RADAR_MODEL,
+        "timestamp": datetime.utcnow().isoformat(),
+        "pricing": {
+            "net_premium": round(net, 2),
+            "ipt": ipt,
+            "gross_premium": gross,
+        },
+        "decision": {"status": status, "notes": notes},
+        "_simulated": True,
+    }
+
+
 st.set_page_config(page_title="Radar HH Quote Analytics", layout="wide", page_icon=":mag:")
 
 st.title("Radar HH Quote Analytics")
@@ -142,6 +192,12 @@ with tab_lookup:
 
         m = meta.iloc[0]
 
+        payloads = {
+            "sf": json.loads(sf_df["payload"].iloc[0]) if not sf_df.empty else None,
+            "rl_req": json.loads(rl_req_df["payload"].iloc[0]) if not rl_req_df.empty else None,
+            "rl_resp": json.loads(rl_resp_df["payload"].iloc[0]) if not rl_resp_df.empty else None,
+        }
+
         # Summary cards
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Status", m["quote_status"])
@@ -153,9 +209,67 @@ with tab_lookup:
         if m["is_outlier"]:
             st.error(
                 "⚠️ **Outlier detected** — this quote sits far outside the peer-group "
-                "distribution. Use the Radar Live response below to replay against "
-                "Radar Base."
+                "distribution. Re-run it against Radar Live below to confirm whether "
+                "the problem is in the pricing engine or upstream in the flow."
             )
+
+        # ---- Re-run against Radar Live (simulated) ----
+        with st.container(border=True):
+            head_col, btn_col = st.columns([4, 1])
+            head_col.markdown(
+                "**Re-run against Radar Live**  \n"
+                f"<span style='opacity:.7'>Stored model: `{m['model_version']}` · "
+                f"Current model: `{CURRENT_RADAR_MODEL}` · "
+                "<em>simulated replay — no live engine</em></span>",
+                unsafe_allow_html=True,
+            )
+            replay_clicked = btn_col.button("▶ Re-run", key=f"replay_{tx_input}",
+                                            use_container_width=True)
+
+            replay_key = f"replay_result_{tx_input}"
+            if replay_clicked:
+                import time
+                with st.spinner("Calling Radar Live..."):
+                    time.sleep(1.2)  # pretend network + model eval
+                    st.session_state[replay_key] = _simulate_radar_replay(
+                        float(m["gross_premium"]) if m["gross_premium"] else 0.0,
+                        m["model_version"],
+                        bool(m["is_outlier"]),
+                        tx_input,
+                        payloads["rl_resp"],
+                    )
+
+            if replay_key in st.session_state:
+                replay = st.session_state[replay_key]
+                stored = float(m["gross_premium"]) if m["gross_premium"] else 0.0
+                new = replay["pricing"]["gross_premium"]
+                delta_pct = ((new - stored) / stored * 100) if stored else 0.0
+
+                a, b, c = st.columns(3)
+                a.metric("Stored gross premium", f"£{stored:,.0f}")
+                b.metric("Re-run gross premium", f"£{new:,.0f}",
+                         f"{delta_pct:+.1f}% vs stored",
+                         delta_color="inverse")
+                c.metric("Replay model", replay["model_version"])
+
+                if abs(delta_pct) > 50:
+                    st.warning(
+                        f"**Large discrepancy ({delta_pct:+.1f}%)** — "
+                        + replay["decision"]["notes"]
+                    )
+                elif abs(delta_pct) > 5:
+                    st.info(
+                        f"Moderate drift ({delta_pct:+.1f}%). "
+                        + replay["decision"]["notes"]
+                    )
+                else:
+                    st.success(
+                        f"Price reproduces ({delta_pct:+.1f}%). "
+                        + replay["decision"]["notes"]
+                    )
+
+                with st.expander("Simulated Radar Live response"):
+                    st.code(json.dumps(replay, indent=2), language="json")
 
         # Flattened customer / property view (what Tom asked for: a flattened view
         # of the JSON, not just raw nested blob)
@@ -180,11 +294,6 @@ with tab_lookup:
 
         # Three payloads
         sub = st.tabs(["Salesforce request", "Radar Live request", "Radar Live response"])
-        payloads = {
-            "sf": json.loads(sf_df["payload"].iloc[0]) if not sf_df.empty else None,
-            "rl_req": json.loads(rl_req_df["payload"].iloc[0]) if not rl_req_df.empty else None,
-            "rl_resp": json.loads(rl_resp_df["payload"].iloc[0]) if not rl_resp_df.empty else None,
-        }
 
         def _payload_panel(label: str, data: dict | None, key: str):
             if data is None:
