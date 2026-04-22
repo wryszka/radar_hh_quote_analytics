@@ -13,9 +13,8 @@ env:
     value: lr_serverless_aws_us_catalog
   - name: DEMO_SCHEMA
     value: radar_hh_quote_analytics
-  # Set after creating the Genie space in step 3:
-  # - name: GENIE_SPACE_ID
-  #   value: <space-id>
+  - name: GENIE_SPACE_ID
+    value: 01f13e0c456d1ddba8bf1f32514d0db4
 resources:
   - name: sql-warehouse
     sql_warehouse:
